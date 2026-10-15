@@ -234,6 +234,39 @@ $(function() {
 					var sensor_labels = [0,0,'Temperature','Humidity'];
 					var traces = [];
 
+					// Aggregated columns arrive as comma separated strings, but a
+					// column is null when a device never reports that metric
+					// (e.g. a sensor with temperature but no humidity), which
+					// used to throw and leave the whole tab empty.
+					var split_column = function(column) {
+						if(column === null || column === undefined || column === '') {
+							return null;
+						}
+						return String(column).split(',');
+					};
+
+					// Numeric series for the y axes: gaps become null so plotly
+					// breaks the line instead of drawing a zero, and a column
+					// without a single usable value is skipped entirely.
+					var split_series = function(column, length) {
+						var values = split_column(column);
+						if(values === null) {
+							return null;
+						}
+						if(length !== undefined && values.length !== length) {
+							return null;
+						}
+						var usable = false;
+						for(var n=0;n<values.length;n++){
+							if(values[n] === '' || isNaN(parseFloat(values[n]))) {
+								values[n] = null;
+							} else {
+								usable = true;
+							}
+						}
+						return usable ? values : null;
+					};
+
 					var inherited_bg_color = self.getInheritedBackgroundColor(document.getElementById('tab_plugin_tasmota'));
 					var background_color = (inherited_bg_color == 'rgba(0, 0, 0, 0)') ? '#FFFFFF' : inherited_bg_color;
                     var color_val = $('#tab_plugin_tasmota').css('color');
@@ -324,12 +357,22 @@ $(function() {
                     }
 
 					for(var i=0;i<data.energy_data.length;i++){
+						var energy_timestamps = split_column(data.energy_data[i][1]);
+						if(energy_timestamps === null) {
+							console.log('skipping energy data without timestamps for ' + data.energy_data[i][0]);
+							continue;
+						}
 						for(var j=2;j<data.energy_data[i].length;j++){
+							var energy_values = split_series(data.energy_data[i][j], energy_timestamps.length);
+							if(energy_values === null) {
+								console.log('skipping ' + energy_labels[j] + ' for ' + data.energy_data[i][0] + ', no usable values');
+								continue;
+							}
 							var trace = {mode: 'lines'};
 							var trace_cost = {x:[],y:[],mode:'lines',name:data.energy_data[i][0] + ' Cost', xaxis:'x4', yaxis:'y4'};
 							trace['name'] = data.energy_data[i][0] + ' ' + energy_labels[j];
-							trace['x'] = data.energy_data[i][1].split(',');
-							trace['y'] = data.energy_data[i][j].split(',');
+							trace['x'] = energy_timestamps;
+							trace['y'] = energy_values;
 							switch (j) {
 							    case 2: // current
 							        trace['xaxis'] = 'x3';
@@ -342,10 +385,9 @@ $(function() {
 							    case 4: // total
 							        trace['xaxis'] = 'x';
 							        trace['yaxis'] = 'y';
-                                    trace_cost['x'] = data.energy_data[i][1].split(',');
-                                    var trace_cost_y = data.energy_data[i][j].split(',');
-                                    for(var k=0;k<trace_cost_y.length;k++){
-                                        trace_cost['y'].push((parseFloat(trace_cost_y[k]) * parseFloat(self.settings.settings.plugins.tasmota.cost_rate())));
+                                    trace_cost['x'] = energy_timestamps;
+                                    for(var k=0;k<energy_values.length;k++){
+                                        trace_cost['y'].push((energy_values[k] === null) ? null : (parseFloat(energy_values[k]) * parseFloat(self.settings.settings.plugins.tasmota.cost_rate())));
                                     }
                                     traces.push(trace_cost);
 							        break;
@@ -357,11 +399,21 @@ $(function() {
 					}
 
 					for(var i=0;i<data.sensor_data.length;i++){
+						var sensor_timestamps = split_column(data.sensor_data[i][1]);
+						if(sensor_timestamps === null) {
+							console.log('skipping sensor data without timestamps for ' + data.sensor_data[i][0]);
+							continue;
+						}
 						for(var j=2;j<data.sensor_data[i].length;j++){
+							var sensor_values = split_series(data.sensor_data[i][j], sensor_timestamps.length);
+							if(sensor_values === null) {
+								console.log('skipping ' + sensor_labels[j] + ' for ' + data.sensor_data[i][0] + ', no usable values');
+								continue;
+							}
 							var trace = {mode: 'lines'};
 							trace['name'] = data.sensor_data[i][0] + ' ' + sensor_labels[j];
-							trace['x'] = data.sensor_data[i][1].split(',');
-							trace['y'] = data.sensor_data[i][j].split(',');
+							trace['x'] = sensor_timestamps;
+							trace['y'] = sensor_values;
 
 						    switch(j) {
 						        case 2:
@@ -394,9 +446,62 @@ $(function() {
 			Plotly.relayout('tasmota_graph',{showlegend: self.legend_visible()});
 		};
 
+		// Live refresh of the graph while the tab is open. Without this the
+		// graph only ever updated on tab change or a manual page reload, even
+		// with polling enabled. See jneilliii/OctoPrint-Tasmota#210.
+		self.graph_refresh_timer = undefined;
+
+		self.graph_window_minutes = function() {
+			var start = moment(self.graph_start_date());
+			var end = moment(self.graph_end_date());
+			if (!start.isValid() || !end.isValid()) {
+				return undefined;
+			}
+			var minutes = end.diff(start, 'minutes');
+			return (minutes > 0) ? minutes : undefined;
+		};
+
+		self.refreshGraph = function() {
+			if (self.processing_api_request()) {
+				// a request is still in flight, skip this round
+				return;
+			}
+			// Only follow along when the end of the window is "now", so a
+			// manually chosen range is left untouched.
+			var window_minutes = self.graph_window_minutes();
+			if (window_minutes !== undefined && moment().diff(moment(self.graph_end_date()), 'minutes') <= 2) {
+				self.graph_end_date(moment().format('YYYY-MM-DDTHH:mm'));
+				self.graph_start_date(moment().subtract(window_minutes, 'minutes').format('YYYY-MM-DDTHH:mm'));
+			}
+			self.plotEnergyData();
+		};
+
+		self.startGraphRefresh = function() {
+			self.stopGraphRefresh();
+			if (!self.settings || !self.settings.settings.plugins.tasmota.polling_enabled()) {
+				return;
+			}
+			var interval = parseFloat(self.settings.settings.plugins.tasmota.polling_interval());
+			if (isNaN(interval) || interval <= 0) {
+				return;
+			}
+			self.graph_refresh_timer = setInterval(self.refreshGraph, interval * 60 * 1000);
+		};
+
+		self.stopGraphRefresh = function() {
+			if (self.graph_refresh_timer !== undefined) {
+				clearInterval(self.graph_refresh_timer);
+				self.graph_refresh_timer = undefined;
+			}
+		};
+
 		self.onTabChange = function(current, previous) {
 			if (current === "#tab_plugin_tasmota") {
 				self.plotEnergyData();
+				self.startGraphRefresh();
+			} else if (previous === "#tab_plugin_tasmota") {
+				// nothing to redraw while the tab is hidden
+				self.stopGraphRefresh();
 			}
 		};
 
@@ -435,10 +540,14 @@ $(function() {
 							   'automaticShutdownEnabled':ko.observable(false),
 							   'event_on_error':ko.observable(false),
 							   'event_on_disconnect':ko.observable(false),
+							   'event_on_shutdown':ko.observable(false),
 							   'event_on_upload':ko.observable(false),
 							   'event_on_connecting':ko.observable(false),
 							   'is_led':ko.observable(false),
 							   'is_sensor_only': ko.observable(false),
+							   'keepalive':ko.observable(false),
+							   'hide_off':ko.observable(false),
+							   'confirm_off':ko.observable(false),
                                'brightness':ko.observable(50)});
 			self.settings.settings.plugins.tasmota.arrSmartplugs.push(self.selectedPlug());
 			$("#TasmotaEditor").modal("show");
@@ -555,7 +664,19 @@ $(function() {
 				    self.processing.remove(data.ip);
 				    console.log('currentState', error);
                 }
-				if (["on", "off"].indexOf(data.currentState) === -1) {
+				// A device configured as a pure sensor (no relay) legitimately
+				// reports no power state, so an unknown state is expected there
+				// and must not raise an error on every poll. Prefer the explicit
+				// "Hide" flag, and fall back to a device that only ever answers
+				// with sensor data.
+				var sensor_only = false;
+				try {
+				    sensor_only = !!ko.utils.unwrapObservable(plug.is_sensor_only) ||
+				                  !!(ko.utils.unwrapObservable(plug.sensor_identifier) && data.sensor_data);
+				} catch (error) {
+				    sensor_only = false;
+				}
+				if (["on", "off"].indexOf(data.currentState) === -1 && !sensor_only) {
                     new PNotify({
                         title: 'Tasmota Error',
                         text: 'Status ' + plug.currentState() + ' for ' + plug.ip() + '. Double check IP Address\\Hostname in Tasmota Settings.',
@@ -575,6 +696,11 @@ $(function() {
             if(data.is_sensor_only()){
                 return
             }
+			// do not start the spinner for a power off that will be refused
+			if(ko.utils.unwrapObservable(data.hide_off) &&
+			   self.arrSmartplugsStates.get(data.ip()+'_'+data.idx())() === "on"){
+				return;
+			}
 			self.processing.push(data.ip());
 			switch(self.arrSmartplugsStates.get(data.ip()+'_'+data.idx())()){
 				case "on":
@@ -613,7 +739,18 @@ $(function() {
 		};
 
 		self.turnOff = function(data) {
-			if((data.displayWarning() || (self.isPrinting() && data.warnPrinting())) && !$("#TasmotaWarning").is(':visible')){
+			// #209: manual power off can be disabled per plug, so an accidental
+			// click cannot cut power to a printer that is mid print or has a
+			// mounted filesystem. Automation is unaffected.
+			if(ko.utils.unwrapObservable(data.hide_off)){
+				console.log('manual power off is disabled for ' + data.ip());
+				self.processing.remove(data.ip());
+				return;
+			}
+			var needs_confirmation = data.displayWarning() ||
+									 ko.utils.unwrapObservable(data.confirm_off) ||
+									 (self.isPrinting() && data.warnPrinting());
+			if(needs_confirmation && !$("#TasmotaWarning").is(':visible')){
 				self.selectedPlug(data);
 				$("#TasmotaWarning").modal("show");
 			} else {

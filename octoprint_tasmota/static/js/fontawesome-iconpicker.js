@@ -366,7 +366,7 @@
     "use strict";
     if (typeof define === "function" && define.amd) {
         define([ "jquery" ], e);
-    } else if (window.jQuery && !window.jQuery.fn.iconpicker) {
+    } else if (window.jQuery && !window.jQuery.fn.tasmotaIconpicker) {
         e(window.jQuery);
     }
 })(function(c) {
@@ -481,7 +481,7 @@
     t.batch = function(e, a) {
         var t = Array.prototype.slice.call(arguments, 2);
         return c(e).each(function() {
-            var e = c(this).data("iconpicker");
+            var e = c(this).data("tasmotaIconpicker");
             if (!!e) {
                 e[a].apply(e, t);
             }
@@ -962,7 +962,7 @@
             if (this.popover.hasClass("in")) {
                 return false;
             }
-            c.iconpicker.batch(c(".iconpicker-popover.in:not(.inline)").not(this.popover), "hide");
+            c.tasmotaIconpicker.batch(c(".iconpicker-popover.in:not(.inline)").not(this.popover), "hide");
             this._trigger("iconpickerShow", {
                 iconpickerValue: this.iconpickerValue
             });
@@ -1022,7 +1022,7 @@
             this._trigger("iconpickerDestroy", {
                 iconpickerValue: this.iconpickerValue
             });
-            this.element.removeData("iconpicker").removeData("iconpickerValue").removeClass("iconpicker-element");
+            this.element.removeData("tasmotaIconpicker").removeData("iconpickerValue").removeClass("iconpicker-element");
             this._unbindElementEvents();
             this._unbindWindowEvents();
             c(this.popover).remove();
@@ -1054,12 +1054,12 @@
             return this.options.placement === "inline" || this.popover.hasClass("inline");
         }
     };
-    c.iconpicker = t;
-    c.fn.iconpicker = function(a) {
+    c.tasmotaIconpicker = t;
+    c.fn.tasmotaIconpicker = function(a) {
         return this.each(function() {
             var e = c(this);
-            if (!e.data("iconpicker")) {
-                e.data("iconpicker", new t(this, typeof a === "object" ? a : {}));
+            if (!e.data("tasmotaIconpicker")) {
+                e.data("tasmotaIconpicker", new t(this, typeof a === "object" ? a : {}));
             }
         });
     };

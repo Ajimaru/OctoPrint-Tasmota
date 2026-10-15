@@ -82,6 +82,20 @@
 					</label>
 				</div>
 			</div>
+			<div class="control-group">
+				<div class="controls">
+					<label class="checkbox">
+					<input type="checkbox" title="{{ _('Wait for the heaters to cool below the idle target temperature before powering off on an error or disconnect, to avoid heat creep in the hotend. Thermal runaway always powers off immediately.') }}" data-toggle="tooltip" data-bind="checked: settings.settings.plugins.tasmota.event_off_wait_for_heaters, enable: settings.settings.plugins.tasmota.event_on_error_monitoring() || settings.settings.plugins.tasmota.event_on_disconnect_monitoring(), tooltip: {}" disabled /> {{ _('Let heaters cool down first') }}
+					</label>
+				</div>
+			</div>
+			<div class="control-group">
+				<div class="controls">
+					<label class="checkbox">
+					<input type="checkbox" title="{{ _('When enabled relays with the option enabled will be powered off as OctoPrint shuts down.') }}" data-toggle="tooltip" data-bind="checked: settings.settings.plugins.tasmota.event_on_shutdown_monitoring, tooltip: {}" /> {{ _('Shutdown Event Monitoring') }}
+					</label>
+				</div>
+			</div>
 		</div>
 		<div class="row-fluid">
 			<div class="control-group">
@@ -129,9 +143,57 @@
 		</div>
 		<div class="row-fluid">
 			<div class="control-group span6">
+				<div class="controls">
+					<label class="checkbox">
+					<input type="checkbox" title="{{ _('Periodically send a command to selected devices so they can run their own watchdog rule and cut power if OctoPrint stops checking in.') }}" data-toggle="tooltip" data-bind="checked: settings.settings.plugins.tasmota.keepalive_enabled, tooltip: {}" /> {{ _('Enable keepalive.') }}
+					</label>
+				</div>
+			</div>
+		</div>
+		<div class="row-fluid" data-bind="visible: settings.settings.plugins.tasmota.keepalive_enabled()">
+			<div class="control-group span6">
+				<label class="control-label">{{ _('Keepalive Interval') }}</label>
+				<div class="controls">
+					<div class="input-append" data-toggle="tooltip" data-bind="tooltip: {}" title="{{ _('How long to wait between keepalive commands. Must be shorter than the timeout of the rule on the device.') }}">
+						<input type="number" min="0" step="0.5" class="input input-mini" data-bind="value: settings.settings.plugins.tasmota.keepalive_interval, enable: settings.settings.plugins.tasmota.keepalive_enabled()" disabled />
+						<span class="add-on">{{ _('mins') }}</span>
+					</div>
+				</div>
+			</div>
+		</div>
+		<div class="row-fluid" data-bind="visible: settings.settings.plugins.tasmota.keepalive_enabled()">
+			<div class="control-group span6">
+				<label class="control-label">{{ _('Keepalive Command') }}</label>
+				<div class="controls">
+					<input type="text" class="input-block-level" data-toggle="tooltip" data-bind="value: settings.settings.plugins.tasmota.keepalive_command, enable: settings.settings.plugins.tasmota.keepalive_enabled(), tooltip: {}" title="{{ _('Command sent to the device, for example Event KEEPALIVE=1') }}" disabled />
+				</div>
+			</div>
+		</div>
+		<div class="row-fluid" data-bind="visible: settings.settings.plugins.tasmota.keepalive_enabled()">
+			<div class="control-group span6">
+				<div class="controls">
+					<label class="checkbox">
+					<input type="checkbox" title="{{ _('Only send keepalive commands while a print is active.') }}" data-toggle="tooltip" data-bind="checked: settings.settings.plugins.tasmota.keepalive_only_while_printing, enable: settings.settings.plugins.tasmota.keepalive_enabled(), tooltip: {}" disabled /> {{ _('Only while printing.') }}
+					</label>
+				</div>
+			</div>
+		</div>
+		<div class="row-fluid">
+			<div class="control-group span6">
+				<label class="control-label">{{ _('Data Retention') }}</label>
+				<div class="controls">
+					<div class="input-append" data-toggle="tooltip" data-bind="tooltip: {}" title="{{ _('Delete energy and sensor readings older than this many days. 0 keeps all history.') }}">
+						<input type="number" min="0" class="input input-mini" data-bind="value: settings.settings.plugins.tasmota.data_retention_days" />
+						<span class="add-on">{{ _('days') }}</span>
+					</div>
+				</div>
+			</div>
+		</div>
+		<div class="row-fluid">
+			<div class="control-group span6">
 				<label class="control-label">{{ _('Cost per kWh') }}</label>
 				<div class="controls">
-					<input type="number" title="{{ _('Amount used to multiply total kWh by to estimate power cost. Leave 0 if you do not have a power reporting device.') }}" data-toggle="tooltip" min="0" step="0.1" class="input input-mini" data-bind="value: settings.settings.plugins.tasmota.cost_rate, tooltip: {}" />
+					<input type="number" title="{{ _('Amount used to multiply total kWh by to estimate power cost. Leave 0 if you do not have a power reporting device.') }}" data-toggle="tooltip" min="0" step="0.0001" class="input input-small" data-bind="value: settings.settings.plugins.tasmota.cost_rate, tooltip: {}" />
 				</div>
 			</div>
 		</div>
@@ -249,7 +311,7 @@
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Color to display when device is on.') }}"><label class="control-label">{{ _('On Color') }}</label><input type="color" class="input input-small" data-bind="value: on_color" /></div></div>
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Color to display when device is off.') }}"><label class="control-label">{{ _('Off Color') }}</label><input type="color" class="input input-small" data-bind="value: off_color" /></div></div>
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Color to display when device status is unknown.') }}"><label class="control-label">{{ _('Unknown Color') }}</label><input type="color" class="input input-small" data-bind="value: unknown_color" /></div></div>
-				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Fontawesom icon class name for navbar button.') }}"><label class="control-label">{{ _('Icon Class') }}</label><input type="text" class="input-block-level" data-bind="value: icon, iconpicker: icon,iconpickerOptions: {hideOnSelect: true, collision: true}" /></div></div>
+				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Fontawesom icon class name for navbar button.') }}"><label class="control-label">{{ _('Icon Class') }}</label><input type="text" class="input-block-level" data-bind="value: icon, tasmotaIconpicker: icon,iconpickerOptions: {hideOnSelect: true, collision: true}" /></div></div>
 				<div class="span1"></div>
 			</div>
 			<div class="row-fluid">
@@ -258,7 +320,8 @@
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Automatically power off when printer is idle.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: automaticShutdownEnabled, enable: $root.settings.settings.plugins.tasmota.powerOffWhenIdle()" /> Off on Idle</label></div></div>
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Power off if temperature exceeds configured max temperatures.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: thermal_runaway" /> Thermal Runaway</label></div></div>
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Automatically power off this relay when Error Event Monitoring is enabled.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: event_on_error, enable: $root.settings.settings.plugins.tasmota.event_on_error_monitoring()" disabled /> {{ _('Off on Error') }}</label></div></div>
-				<div class="span2"><div class="controls"data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Automatically power off this relay when Disconnect Event Monitoring is enabled.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: event_on_disconnect, enable: $root.settings.settings.plugins.tasmota.event_on_disconnect_monitoring()" disabled /> {{ _('Off on Disconnect') }}</label></div></td>
+				<div class="span2"><div class="controls"data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Automatically power off this relay when Disconnect Event Monitoring is enabled.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: event_on_disconnect, enable: $root.settings.settings.plugins.tasmota.event_on_disconnect_monitoring()" disabled /> {{ _('Off on Disconnect') }}</label></div></div>
+				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Automatically power off this relay when Shutdown Event Monitoring is enabled.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: event_on_shutdown, enable: $root.settings.settings.plugins.tasmota.event_on_shutdown_monitoring()" disabled /> {{ _('Off on Shutdown') }}</label></div>
             </div>
 			<div class="row-fluid">
 				<div class="span2">
@@ -279,6 +342,12 @@
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Prompt for confirmation before powering off via the navbar button.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: displayWarning" /> Warning Prompt</label></div></div>
 				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Prompt for confirmation before powering off when a print is active.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: warnPrinting" /> Warn While Printing</label></div></div>
 				<div class="span2"></div>
+			</div>
+			<div class="row-fluid">
+				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Always prompt for confirmation before powering off manually, even when idle.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: confirm_off" /> {{ _('Always Confirm Off') }}</label></div></div>
+				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Disable manual power off for this device completely. Automatic power off and gcode still work.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: hide_off" /> {{ _('Disable Manual Off') }}</label></div></div>
+				<div class="span2"><div class="controls" data-toggle="tooltip" data-bind="tooltip: {container: '#TasmotaEditor'}" title="{{ _('Include this device in the keepalive interval configured in the plugin settings.') }}"><label class="checkbox"><input type="checkbox" data-bind="checked: keepalive" /> {{ _('Send Keepalive') }}</label></div></div>
+				<div class="span6"></div>
 			</div>
 			<div class="row-fluid">
 				<div class="span6">

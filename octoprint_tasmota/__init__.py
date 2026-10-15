@@ -9,6 +9,7 @@ from flask_babel import gettext
 import time
 import logging
 import os
+import re
 import requests
 import threading
 import sqlite3
@@ -70,20 +71,39 @@ except ImportError:
 				self.on_reset()
 
 
+CREDENTIAL_PATTERN = re.compile(r'((?:user|password)=)[^&\s\'"]*')
+
+
+class RedactingFormatter(logging.Formatter):
+	"""Formatter that masks device credentials.
+
+	Tasmota is queried over HTTP with the user and password as query
+	parameters, so the plain URL shows up in request exceptions and their
+	tracebacks. The debug log is what users attach to bug reports, so it
+	must never contain the real password.
+	"""
+
+	def format(self, record):
+		return CREDENTIAL_PATTERN.sub(r'\1<redacted>', super().format(record))
+
+
 class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 					octoprint.plugin.AssetPlugin,
 					octoprint.plugin.TemplatePlugin,
 					octoprint.plugin.SimpleApiPlugin,
 					octoprint.plugin.StartupPlugin,
 					octoprint.plugin.ProgressPlugin,
+					octoprint.plugin.ShutdownPlugin,
 					octoprint.plugin.EventHandlerPlugin):
 
 	def __init__(self):
 		self.print_job_power = 0.0
+		self.print_job_power_start = {}
 		self._logger = logging.getLogger("octoprint.plugins.tasmota")
 		self._tasmota_logger = logging.getLogger("octoprint.plugins.tasmota.debug")
 		self.thermal_runaway_triggered = False
 		self.poll_status = None
+		self.keepalive_timer = None
 		self.abortTimeout = 0
 		self._timeout_value = None
 		self._abort_timer = None
@@ -105,7 +125,8 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 		from octoprint.logging.handlers import CleaningTimedRotatingFileHandler
 		tasmota_logging_handler = CleaningTimedRotatingFileHandler(
 			self._settings.get_plugin_logfile_path(postfix="debug"), when="D", backupCount=3)
-		tasmota_logging_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+		tasmota_logging_handler.setFormatter(
+			RedactingFormatter("[%(asctime)s] %(levelname)s: %(message)s"))
 		tasmota_logging_handler.setLevel(logging.DEBUG)
 
 		self._tasmota_logger.addHandler(tasmota_logging_handler)
@@ -130,6 +151,11 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			db.commit()
 			db.close()
 
+		# outside the creation guards on purpose, so databases that already
+		# exist get the index as well
+		self._create_db_indexes()
+		self._prune_databases()
+
 		self.abortTimeout = self._settings.get_int(["abortTimeout"])
 		self._tasmota_logger.debug("abortTimeout: %s" % self.abortTimeout)
 
@@ -152,6 +178,25 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			self.poll_status = RepeatedTimer(float(self._settings.get_float(["polling_interval"])) * 60,
 											 self.check_statuses)
 			self.poll_status.start()
+		self._restart_keepalive_timer()
+
+	##~~ ShutdownPlugin mixin
+
+	def on_shutdown(self):
+		"""Stop our own timers so they cannot fire during shutdown.
+
+		Must stay non blocking: OctoPrint warns that long running work here
+		breaks the server. The actual power off happens in the SHUTDOWN event
+		handler.
+		"""
+		for timer in (self.poll_status, self.keepalive_timer):
+			if timer is not None:
+				try:
+					timer.cancel()
+				except Exception:
+					pass
+		self.poll_status = None
+		self.keepalive_timer = None
 
 	##~~ SettingsPlugin mixin
 
@@ -166,6 +211,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			"event_on_error_monitoring": False,
 			"event_on_disconnect_monitoring": False,
 			"event_on_connecting_monitoring": False,
+			"event_on_shutdown_monitoring": False,
 			"arrSmartplugs": [],
 			"abortTimeout": 30,
 			"powerOffWhenIdle": False,
@@ -178,13 +224,22 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			"event_on_upload_monitoring_always": False,
 			"event_on_upload_monitoring_start_print": False,
 			"cost_rate": 0,
-			"request_timeout": 3
+			"request_timeout": 3,
+			# 0 keeps all history, so nothing is ever deleted by default
+			"data_retention_days": 0,
+			# delay power off after an error/disconnect so the hotend can cool
+			"event_off_wait_for_heaters": False,
+			# periodic request for a device side watchdog
+			"keepalive_enabled": False,
+			"keepalive_interval": 1,
+			"keepalive_command": "Event KEEPALIVE=1",
+			"keepalive_only_while_printing": False
 		}
 
 	def on_settings_save(self, data):
 		old_debug_logging = self._settings.get_boolean(["debug_logging"])
-		old_polling_value = self._settings.get_boolean(["pollingEnabled"])
-		old_polling_timer = self._settings.get(["pollingInterval"])
+		old_polling_value = self._settings.get_boolean(["polling_enabled"])
+		old_polling_timer = self._settings.get(["polling_interval"])
 		old_powerOffWhenIdle = self._settings.get_boolean(["powerOffWhenIdle"])
 		old_idleTimeout = self._settings.get_int(["idleTimeout"])
 		old_idleIgnoreCommands = self._settings.get(["idleIgnoreCommands"])
@@ -213,8 +268,8 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			self._stop_idle_timer()
 
 		new_debug_logging = self._settings.get_boolean(["debug_logging"])
-		new_polling_value = self._settings.get_boolean(["pollingEnabled"])
-		new_polling_timer = self._settings.get(["pollingInterval"])
+		new_polling_value = self._settings.get_boolean(["polling_enabled"])
+		new_polling_timer = self._settings.get(["polling_interval"])
 
 		if old_debug_logging != new_debug_logging:
 			if new_debug_logging:
@@ -227,11 +282,15 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				self.poll_status.cancel()
 
 			if new_polling_value:
-				self.poll_status = RepeatedTimer(self._settings.get_float(["pollingInterval"]) * 60, self.check_statuses)
+				self.poll_status = RepeatedTimer(self._settings.get_float(["polling_interval"]) * 60, self.check_statuses)
 				self.poll_status.start()
 
+		# keepalive settings and retention may have changed
+		self._restart_keepalive_timer()
+		self._prune_databases()
+
 	def get_settings_version(self):
-		return 12
+		return 13
 
 	def on_settings_migrate(self, target, current=None):
 		if current is None or current < 6:
@@ -282,6 +341,16 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				plug["is_sensor_only"] = False
 				arrSmartplugs_new.append(plug)
 			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+		if current < 13:
+			# Add new fields, all defaulting to the previous behaviour
+			arrSmartplugs_new = []
+			for plug in self._settings.get(['arrSmartplugs']):
+				plug["keepalive"] = False
+				plug["hide_off"] = False
+				plug["confirm_off"] = False
+				plug["event_on_shutdown"] = False
+				arrSmartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
 
 	##~~ AssetPlugin mixin
 
@@ -329,10 +398,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 		# Error Event
 		if event == Events.ERROR and self._settings.get_boolean(["event_on_error_monitoring"]):
 			self._tasmota_logger.debug("powering off due to %s event." % event)
-			for plug in self._settings.get(['arrSmartplugs']):
-				if plug["event_on_error"] == True:
-					self._tasmota_logger.debug("powering off %s:%s due to %s event." % (plug["ip"], plug["idx"], event))
-					self.turn_off(plug["ip"], plug["idx"])
+			self._power_off_for_event(event, "event_on_error")
 
 		if event == Events.CONNECTING and self._settings.get_boolean(
 				["event_on_connecting_monitoring"]) and self._printer.is_closed_or_error:
@@ -345,10 +411,25 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 		# Disconnected Event
 		if event == Events.DISCONNECTED and self._settings.get_boolean(["event_on_disconnect_monitoring"]):
 			self._tasmota_logger.debug("powering off due to %s event." % event)
+			self._power_off_for_event(event, "event_on_disconnect")
+
+		# Shutdown Event
+		if event == Events.SHUTDOWN and self._settings.get_boolean(["event_on_shutdown_monitoring"]):
+			# Runs synchronously on purpose: this is the last event OctoPrint
+			# processes, so a background thread would be killed before it got
+			# to send anything. The heater cool down option is deliberately
+			# not honoured here for the same reason.
+			# See jneilliii/OctoPrint-Tasmota#180.
+			self._tasmota_logger.debug("powering off due to %s event." % event)
 			for plug in self._settings.get(['arrSmartplugs']):
-				if plug["event_on_disconnect"] == True:
-					self._tasmota_logger.debug("powering off %s:%s due to %s event." % (plug["ip"], plug["idx"], event))
-					self.turn_off(plug["ip"], plug["idx"])
+				if plug.get("event_on_shutdown") == True:
+					self._tasmota_logger.debug(
+						"powering off %s:%s due to %s event." % (plug["ip"], plug["idx"], event))
+					try:
+						self.turn_off(plug["ip"], plug["idx"])
+					except Exception as e:
+						self._tasmota_logger.error(
+							"could not power off %s on shutdown: %s" % (plug["ip"], self.redact(e)))
 
 		# Client Opened Event
 		if event == Events.CLIENT_OPENED:
@@ -404,10 +485,17 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 														 {'thermal_runaway': True, 'type': "connection"})
 				self._tasmota_logger.debug("thermal runaway event triggered prior to last connection.")
 				self.thermal_runaway_triggered = False
+			self.print_job_power_start = {}
 			for plug in self._settings.get(["arrSmartplugs"]):
 				status = self.check_status(plug["ip"], plug["idx"])
-				self.print_job_power -= float(self.deep_get(status, ["energy_data", "Total"], default=0))
-				self._tasmota_logger.debug(self.print_job_power)
+				total = self.deep_get(status, ["energy_data", "Total"], default=None)
+				if total is None:
+					continue
+				try:
+					self.print_job_power_start["%s:%s" % (plug["ip"], plug["idx"])] = float(total)
+				except (TypeError, ValueError):
+					continue
+			self._tasmota_logger.debug("energy counters at print start: %s" % self.print_job_power_start)
 
 		if event == Events.PRINT_STARTED:
 			self._autostart_file = None
@@ -428,29 +516,59 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 		if event == Events.PRINT_DONE and self.print_job_started:
 			self._tasmota_logger.debug(payload)
 
-			for plug in self._settings.get(["arrSmartplugs"]):
-				status = self.check_status(plug["ip"], plug["idx"])
-				self.print_job_power += float(self.deep_get(status, ["energy_data", "Total"], default=0))
-				self._tasmota_logger.debug(self.print_job_power)
+			try:
+				# Tasmota's ENERGY.Total is a cumulative kWh meter, so the
+				# difference between print start and end already is the energy
+				# used by this print. Tracked per plug to avoid mixing in
+				# devices that have nothing to do with the printer.
+				self.print_job_power = 0.0
+				for plug in self._settings.get(["arrSmartplugs"]):
+					plug_key = "%s:%s" % (plug["ip"], plug["idx"])
+					if plug_key not in self.print_job_power_start:
+						continue
+					status = self.check_status(plug["ip"], plug["idx"])
+					total = self.deep_get(status, ["energy_data", "Total"], default=None)
+					if total is None:
+						self._tasmota_logger.debug(
+							"no energy counter for %s at print end, skipping" % plug_key)
+						continue
+					try:
+						used = float(total) - self.print_job_power_start[plug_key]
+					except (TypeError, ValueError):
+						continue
+					if used < 0:
+						# counter was reset (EnergyReset/firmware update) mid print
+						self._tasmota_logger.debug(
+							"energy counter for %s went backwards, skipping" % plug_key)
+						continue
+					self._tasmota_logger.debug("%s used %s kWh" % (plug_key, used))
+					self.print_job_power += used
 
-			hours = (payload.get("time", 0) / 60) / 60
-			self._tasmota_logger.debug("hours: %s" % hours)
-			power_used = self.print_job_power * hours
-			self._tasmota_logger.debug("power used: %s" % power_used)
-			power_cost = power_used * self._settings.get_float(["cost_rate"])
-			self._tasmota_logger.debug("power total cost: %s" % power_cost)
+				self._tasmota_logger.debug("power used: %s kWh" % self.print_job_power)
+				power_cost = self.print_job_power * self._settings.get_float(["cost_rate"])
+				self._tasmota_logger.debug("power total cost: %s" % power_cost)
 
-			self._storage_interface = self._file_manager._storage(payload.get("origin", "local"))
-			self._storage_interface.set_additional_metadata(payload.get("path"), "statistics", {
-				'lastPowerCost': {'_default': float('{:.4f}'.format(power_cost))}}, merge=True)
-
-			self._autostart_file = None
-			self.print_job_power = 0.0
-			self.print_job_started = False
+				try:
+					self._storage_interface = self._file_manager._storage(payload.get("origin", "local"))
+					self._storage_interface.set_additional_metadata(payload.get("path"), "statistics", {
+						'lastPowerCost': {'_default': float('{:.4f}'.format(power_cost))}}, merge=True)
+				except Exception:
+					# not all storage backends support custom metadata (SD card,
+					# moonraker/bambu backed storage), which must not abort the
+					# rest of this event handler
+					self._tasmota_logger.debug(
+						"could not store power cost metadata for %s" % payload.get("path"),
+						exc_info=True)
+			finally:
+				self._autostart_file = None
+				self.print_job_power = 0.0
+				self.print_job_power_start = {}
+				self.print_job_started = False
 
 		if event == Events.PRINT_CANCELLED:
 			self._autostart_file = None
 			self.print_job_power = 0.0
+			self.print_job_power_start = {}
 			self.print_job_started = False
 
 		# Timelapse events
@@ -559,7 +677,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 		if plugip != "":
 			try:
 				plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip, "idx", plugidx)
-				self._tasmota_logger.debug(plug)
+				self._tasmota_logger.debug(self.redacted_plug(plug))
 				webresponse = requests.get("http://{}/cm".format(plugip),
 										   params={"user": plug["username"], "password": plug["password"],
 												   "cmnd": "Status 0"},
@@ -570,6 +688,11 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				self._tasmota_logger.debug("%s index %s response: %s" % (plugip, plugidx, response))
 				# chk = response["POWER%s" % plugidx]
 				chk = self.lookup(response, *["StatusSTS", "POWER" + plugidx])
+				if chk is None and plugidx in ("", "1"):
+					# single relay devices report a plain "POWER" key, which is
+					# missed when an index is configured, and devices with a
+					# blank index never match "POWER" + "" either
+					chk = self.lookup(response, *["StatusSTS", "POWER"])
 				if chk is None:
 					chk = "UNKNOWN"
 				energy_data = self.lookup(response, *["StatusSNS", "ENERGY"])
@@ -614,8 +737,19 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 						db.close()
 				else:
 					sensor_data = None
-			except:
-				self._tasmota_logger.error('Invalid ip or unknown error connecting to %s.' % plugip, exc_info=True)
+			except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+				# offline device: log one line instead of a traceback on every
+				# poll, otherwise a permanently unreachable plug floods the log
+				self._tasmota_logger.warning(
+					'Could not reach %s index %s: %s' % (plugip, plugidx, self.redact(e)))
+				response = "unknown error with %s." % plugip
+				chk = "UNKNOWN"
+				energy_data = None
+				sensor_data = None
+			except Exception as e:
+				self._tasmota_logger.error(
+					'Invalid ip or unknown error connecting to %s: %s' % (plugip, self.redact(e)),
+					exc_info=True)
 				response = "unknown error with %s." % plugip
 				chk = "UNKNOWN"
 				energy_data = None
@@ -672,6 +806,17 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			self.turn_on("{ip}".format(**data), "{idx}".format(**data))
 		# return flask.jsonify(self.check_status("{ip}".format(**data), "{idx}".format(**data)))
 		elif command == 'turnOff':
+			# #209: when manual power off is hidden for a plug, enforce it here
+			# as well so the UI is not the only thing preventing it. Automation
+			# (idle timeout, events, gcode) goes through turn_off directly and
+			# is intentionally unaffected.
+			plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip",
+									"{ip}".format(**data), "idx", "{idx}".format(**data))
+			if plug is not None and plug.get("hide_off"):
+				self._tasmota_logger.info(
+					"Manual power off is disabled for %s:%s, ignoring request." % (
+						"{ip}".format(**data), "{idx}".format(**data)))
+				return flask.make_response("Manual power off is disabled for this device", 403)
 			self.turn_off("{ip}".format(**data), "{idx}".format(**data))
 		# return flask.jsonify(self.check_status("{ip}".format(**data), "{idx}".format(**data)))
 
@@ -719,7 +864,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			energy_db = sqlite3.connect(self.energy_db_path)
 			energy_cursor = energy_db.cursor()
 			energy_cursor.execute(
-				'''SELECT ip || ':' || idx AS ip, group_concat(timestamp) as timestamp, group_concat(current) as current, group_concat(power) as power, group_concat(total) as total FROM energy_data WHERE timestamp BETWEEN ? AND ? GROUP BY ip, idx''',
+				'''SELECT ip || ':' || idx AS ip, group_concat(timestamp) as timestamp, group_concat(ifnull(current, '')) as current, group_concat(ifnull(power, '')) as power, group_concat(ifnull(total, '')) as total FROM (SELECT * FROM energy_data WHERE timestamp BETWEEN ? AND ? ORDER BY ip, idx, timestamp) GROUP BY ip, idx''',
 				[start_date, end_date])
 			response["energy_data"] = energy_cursor.fetchall()
 			energy_db.close()
@@ -727,7 +872,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			sensor_db = sqlite3.connect(self.sensor_db_path)
 			sensor_cursor = sensor_db.cursor()
 			sensor_cursor.execute(
-				'''SELECT ip || ':' || idx AS ip, group_concat(timestamp) as timestamp, group_concat(temperature) as temperature, group_concat(humidity) as humidity FROM sensor_data WHERE timestamp BETWEEN ? AND ? GROUP BY ip, idx''',
+				'''SELECT ip || ':' || idx AS ip, group_concat(timestamp) as timestamp, group_concat(ifnull(temperature, '')) as temperature, group_concat(ifnull(humidity, '')) as humidity FROM (SELECT * FROM sensor_data WHERE timestamp BETWEEN ? AND ? ORDER BY ip, idx, timestamp) GROUP BY ip, idx''',
 				[start_date, end_date])
 			response["sensor_data"] = sensor_cursor.fetchall()
 			sensor_db.close()
@@ -776,7 +921,9 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 															 {'currentState': "on", 'ip': plug["ip"],
 															  'idx': plug["idx"], 'color': led_data})
 				except Exception as e:
-					self._logger.debug("Error: {}".format(e))
+					# goes to octoprint.log, which is not covered by the
+					# redacting formatter on the plugin's own handler
+					self._logger.debug("Error: {}".format(self.redact(e)))
 
 	def process_echo(self, comm, line, *args, **kwargs):
 		if not line.startswith("TASMOTA_M150"):
@@ -1018,7 +1165,10 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 			highest_temp = 0
 			heaters_above_waittemp = []
 			for heater, entry in heaters.items():
-				if not heater.startswith("tool") or heater in ignored_heaters:
+				# the tooltip promises to wait for all heaters, so the bed and
+				# chamber have to be included here as well; anything the user
+				# does not want to wait for goes into idleIgnoreHeaters
+				if heater in ignored_heaters:
 					continue
 
 				actual = entry.get("actual")
@@ -1085,6 +1235,180 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 		if keys:
 			return self.lookup(dic.get(key, {}), *keys)
 		return dic.get(key)
+
+	##~~ Keepalive
+
+	def _restart_keepalive_timer(self):
+		"""(Re)start the keepalive timer from the current settings.
+
+		Sends a user defined command to every plug at a fixed interval so the
+		device can run its own watchdog rule and cut power when OctoPrint stops
+		checking in. See jneilliii/OctoPrint-Tasmota#191.
+		"""
+		if self.keepalive_timer is not None:
+			self.keepalive_timer.cancel()
+			self.keepalive_timer = None
+
+		if not self._settings.get_boolean(["keepalive_enabled"]):
+			return
+
+		try:
+			interval = float(self._settings.get_float(["keepalive_interval"]))
+		except (TypeError, ValueError):
+			interval = 0
+		if interval <= 0:
+			self._tasmota_logger.warning("keepalive enabled but interval is not positive, not starting")
+			return
+
+		self.keepalive_timer = RepeatedTimer(interval * 60, self._send_keepalive)
+		self.keepalive_timer.start()
+		self._tasmota_logger.debug("keepalive timer started, every %s minute(s)" % interval)
+
+	def _send_keepalive(self):
+		command = self._settings.get(["keepalive_command"])
+		if not command:
+			return
+		if self._settings.get_boolean(["keepalive_only_while_printing"]) and not self._printer.is_printing():
+			self._tasmota_logger.debug("skipping keepalive, not printing")
+			return
+
+		for plug in self._settings.get(["arrSmartplugs"]):
+			if not plug.get("keepalive"):
+				continue
+			try:
+				webresponse = requests.get("http://{}/cm".format(plug["ip"]),
+										   params={"user": plug["username"], "password": plug["password"],
+												   "cmnd": command},
+										   timeout=self._settings.get_int(["request_timeout"]))
+				self._tasmota_logger.debug(
+					"keepalive sent to %s:%s, status %s" % (plug["ip"], plug["idx"], webresponse.status_code))
+			except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+				self._tasmota_logger.warning(
+					"keepalive could not reach %s: %s" % (plug["ip"], self.redact(e)))
+			except Exception as e:
+				self._tasmota_logger.error(
+					"keepalive failed for %s: %s" % (plug["ip"], self.redact(e)), exc_info=True)
+
+	##~~ Event triggered power off
+
+	def _power_off_for_event(self, event, plug_flag):
+		"""Power off every plug that opted into this event.
+
+		With event_off_wait_for_heaters enabled the power off is delayed until
+		the heaters have cooled below the idle target, which avoids heat creep
+		in the hotend after a disconnect or a firmware error. Thermal runaway
+		is handled elsewhere and is never delayed.
+		See jneilliii/OctoPrint-Tasmota#163.
+		"""
+		plugs = [plug for plug in self._settings.get(['arrSmartplugs']) if plug.get(plug_flag) == True]
+		if not plugs:
+			return
+
+		def power_off():
+			for plug in plugs:
+				self._tasmota_logger.debug(
+					"powering off %s:%s due to %s event." % (plug["ip"], plug["idx"], event))
+				self.turn_off(plug["ip"], plug["idx"])
+
+		if not self._settings.get_boolean(["event_off_wait_for_heaters"]):
+			power_off()
+			return
+
+		def wait_then_power_off():
+			try:
+				self._tasmota_logger.debug(
+					"waiting for heaters to cool before powering off due to %s event." % event)
+				if self._wait_for_heaters():
+					self._tasmota_logger.debug("heaters below temperature, powering off.")
+					power_off()
+				else:
+					self._tasmota_logger.debug("cool down aborted, leaving power on.")
+			except Exception as e:
+				# never leave the printer powered on because of a bug in here
+				self._tasmota_logger.error(
+					"error while waiting for heaters, powering off anyway: %s" % self.redact(e),
+					exc_info=True)
+				power_off()
+
+		# _wait_for_heaters polls in a loop, so it must not block the event bus
+		thread = threading.Thread(target=wait_then_power_off)
+		thread.daemon = True
+		thread.start()
+
+	##~~ Database maintenance
+
+	def _db_targets(self):
+		return ((self.energy_db_path, "energy_data"), (self.sensor_db_path, "sensor_data"))
+
+	def _create_db_indexes(self):
+		"""Index the timestamp range the graph query filters on.
+
+		The tables are append only and were created without any index, so
+		every graph request had to scan the whole table. The index leads with
+		timestamp because that is the WHERE clause; leading with (ip, idx)
+		instead only lets sqlite skip the GROUP BY sort, which measured no
+		faster than the plain scan.
+		"""
+		for db_path, table in self._db_targets():
+			if not os.path.exists(db_path):
+				continue
+			try:
+				db = sqlite3.connect(db_path)
+				db.execute(
+					"CREATE INDEX IF NOT EXISTS idx_%s_timestamp ON %s(timestamp)" % (table, table))
+				db.commit()
+				db.close()
+			except Exception as e:
+				self._tasmota_logger.warning(
+					"could not create index on %s: %s" % (table, self.redact(e)))
+
+	def _prune_databases(self):
+		"""Drop rows older than the configured retention, if any.
+
+		Retention defaults to 0, which keeps everything, so no data is ever
+		removed unless the user asks for it.
+		"""
+		try:
+			retention_days = self._settings.get_int(["data_retention_days"])
+		except (TypeError, ValueError):
+			retention_days = 0
+		if not retention_days or retention_days <= 0:
+			return
+
+		cutoff = (datetime.today() - timedelta(days=retention_days)).isoformat(' ')
+		for db_path, table in self._db_targets():
+			if not os.path.exists(db_path):
+				continue
+			try:
+				db = sqlite3.connect(db_path)
+				cursor = db.cursor()
+				cursor.execute("DELETE FROM %s WHERE timestamp < ?" % table, [cutoff])
+				removed = cursor.rowcount
+				db.commit()
+				db.close()
+				if removed > 0:
+					self._tasmota_logger.info(
+						"pruned %s rows older than %s from %s" % (removed, cutoff, table))
+			except Exception as e:
+				self._tasmota_logger.warning(
+					"could not prune %s: %s" % (table, self.redact(e)))
+
+	def redact(self, text):
+		"""Mask credentials in anything that gets logged.
+
+		Debug logs are routinely attached to bug reports, so device
+		passwords must not end up in them verbatim.
+		"""
+		return CREDENTIAL_PATTERN.sub(r'\1<redacted>', str(text))
+
+	def redacted_plug(self, plug):
+		"""Copy of a plug config with the password masked, safe to log."""
+		if not isinstance(plug, dict):
+			return plug
+		sanitized = dict(plug)
+		if sanitized.get("password"):
+			sanitized["password"] = "<redacted>"
+		return sanitized
 
 	def plug_search(self, list, key1, value1, key2, value2):
 		for item in list:
