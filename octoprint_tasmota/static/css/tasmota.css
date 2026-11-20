@@ -82,6 +82,39 @@ input[type="datetime-local"].alert-error {
     float: left;
 }
 
+/* Brightness slider for dimmable plugs: a caret right after the navbar
+   button opens a small dropdown. The caret sits inside a span, so it does
+   not get Bootstrap's ".nav > li > a" padding and needs its own. */
+#navbar_plugin_tasmota > span.tasmota_dimmer {
+    float: left;
+}
+#navbar_plugin_tasmota > span.tasmota_dimmer > a.tasmota_dimmer_toggle {
+    display: block;
+    margin-left: -10px;
+    padding: 10px 10px 10px 2px;
+    text-decoration: none;
+}
+#navbar_plugin_tasmota .tasmota_dimmer_menu {
+    padding: 8px 12px;
+    min-width: 0;
+    white-space: nowrap;
+}
+#navbar_plugin_tasmota .tasmota_dimmer_title {
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+#navbar_plugin_tasmota .tasmota_dimmer_menu input[type=range] {
+    width: 150px;
+    margin: 0;
+    vertical-align: middle;
+}
+#navbar_plugin_tasmota .tasmota_dimmer_value {
+    display: inline-block;
+    min-width: 3.5em;
+    text-align: right;
+    vertical-align: middle;
+}
+
 /* For popover */
 #navbar_plugin_tasmota div.popover {
     width: auto !important;

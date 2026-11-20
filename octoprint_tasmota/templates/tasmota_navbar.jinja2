@@ -1,5 +1,16 @@
 <!-- ko foreach: settings.settings.plugins.tasmota.arrSmartplugs -->
 <a class="tasmota_button hide_popover_content" href="#" data-bind="click: $root.toggleRelay,visible: $root.loginState.loggedIn(), popover: {title: $data.label, html: true, content: $root.arrSmartplugsTooltips.get(ip()+'_'+idx()), placement: 'bottom', trigger: 'hover'}, attr: { id: ('tasmota_button_link_'+ip()+'_'+idx()).replace(/[.:]/g, '_')}" style="display: none;"><i class="icon" data-bind="css: [$root.arrSmartplugsStates.get(ip()+'_'+idx())(), icon(),(($root.processing().indexOf(ip()) > -1) ? 'icon-spin' : '')].join(' '), style: {color: $root.get_color($data)}" aria-hidden="true"></i><div class="tasmota_label" data-bind="text: $data.label_extended"></div></a>
+<!-- ko if: ko.utils.unwrapObservable($data.is_dimmable) -->
+<span class="dropdown tasmota_dimmer" data-bind="visible: $root.loginState.loggedIn()">
+	<a href="#" class="dropdown-toggle tasmota_dimmer_toggle" data-toggle="dropdown" title="{{ _('Brightness') }}"><i class="fa fa-caret-down" data-bind="style: {color: $root.get_color($data)}" aria-hidden="true"></i></a>
+	<!-- clickBubble: false keeps Bootstrap from closing the menu while the slider is dragged -->
+	<div class="dropdown-menu pull-right tasmota_dimmer_menu" data-bind="click: function() { return true; }, clickBubble: false">
+		<div class="tasmota_dimmer_title" data-bind="text: $data.label_extended() || $data.label()"></div>
+		<input type="range" min="1" max="100" step="1" data-bind="value: $root.arrSmartplugsDimmer.get(ip()+'_'+idx()), valueUpdate: 'input', event: {change: $root.setDimmer}, enable: $root.processing().indexOf(ip()) === -1" />
+		<span class="tasmota_dimmer_value" data-bind="text: $root.dimmerText($data)"></span>
+	</div>
+</span>
+<!-- /ko -->
 <!-- /ko -->
 <div id="TasmotaWarning" data-bind="with: selectedPlug" class="modal hide fade">
     <div class="modal-header">

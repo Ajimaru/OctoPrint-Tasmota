@@ -290,7 +290,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 		self._prune_databases()
 
 	def get_settings_version(self):
-		return 13
+		return 14
 
 	def on_settings_migrate(self, target, current=None):
 		if current is None or current < 6:
@@ -349,6 +349,13 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				plug["hide_off"] = False
 				plug["confirm_off"] = False
 				plug["event_on_shutdown"] = False
+				arrSmartplugs_new.append(plug)
+			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
+		if current < 14:
+			# Brightness slider for dimmable lights, off by default
+			arrSmartplugs_new = []
+			for plug in self._settings.get(['arrSmartplugs']):
+				plug["is_dimmable"] = False
 				arrSmartplugs_new.append(plug)
 			self._settings.set(["arrSmartplugs"], arrSmartplugs_new)
 
@@ -686,6 +693,10 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				self._tasmota_logger.debug("check status text: {}".format(webresponse.text))
 				response = webresponse.json()
 				self._tasmota_logger.debug("%s index %s response: %s" % (plugip, plugidx, response))
+				# Status 0 already carries the light's brightness, so a dimmable
+				# plug needs no extra request. Devices with several separately
+				# dimmable lights (Dimmer1/Dimmer2) are not covered.
+				dimmer = self.lookup(response, *["StatusSTS", "Dimmer"]) if plug is not None and plug.get("is_dimmable") else None
 				# chk = response["POWER%s" % plugidx]
 				chk = self.lookup(response, *["StatusSTS", "POWER" + plugidx])
 				if chk is None and plugidx in ("", "1"):
@@ -746,6 +757,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				chk = "UNKNOWN"
 				energy_data = None
 				sensor_data = None
+				dimmer = None
 			except Exception as e:
 				self._tasmota_logger.error(
 					'Invalid ip or unknown error connecting to %s: %s' % (plugip, self.redact(e)),
@@ -754,6 +766,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				chk = "UNKNOWN"
 				energy_data = None
 				sensor_data = None
+				dimmer = None
 
 			self._tasmota_logger.debug("%s index %s is %s" % (plugip, plugidx, chk))
 			if chk.upper() in ["ON", "1"]:
@@ -773,8 +786,35 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 				response = {"currentState": "unknown", "ip": plugip, "idx": plugidx, "energy_data": energy_data,
 							"sensor_data": sensor_data}
 
+			if dimmer is not None:
+				response["dimmer"] = dimmer
 			self._plugin_manager.send_plugin_message(self._identifier, response)
 			return response
+
+	def set_dimmer(self, plugip, plugidx, value):
+		"""
+		Set the brightness (0-100) of a plug marked as dimmable and return its
+		fresh status. Tasmota powers the light on for Dimmer 1-100 by itself.
+		0 is sent as a plain Power off instead of "Dimmer 0": Tasmota would store
+		0 as the brightness, and the next power on from the navbar button would
+		then light up at 0 %, i.e. stay dark (checked on Tasmota 16.0.0).
+		Returns None for a plug that is unknown or not dimmable.
+		"""
+		plug = self.plug_search(self._settings.get(["arrSmartplugs"]), "ip", plugip, "idx", plugidx)
+		if plug is None or not plug.get("is_dimmable"):
+			return None
+		self._tasmota_logger.debug("Setting dimmer of %s index %s to %s." % (plugip, plugidx, value))
+		try:
+			requests.get("http://{}/cm".format(plugip),
+						 params={"user": plug["username"], "password": plug["password"],
+								 "cmnd": "Dimmer {}".format(value) if value > 0 else "Power{} off".format(plugidx)},
+						 timeout=self._settings.get_int(["request_timeout"]))
+		except Exception as e:
+			self._tasmota_logger.warning(
+				'Could not set dimmer of %s index %s: %s' % (plugip, plugidx, self.redact(e)))
+		# check_status sends the complete message (state, brightness, sensor and
+		# energy data), so the tooltip is not reset to a partial one
+		return self.check_status(plugip, plugidx)
 
 	def checkSetOption26(self, plugip, username, password):
 		webresponse = requests.get("http://{}/cm".format(plugip),
@@ -794,6 +834,7 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 
 	def get_api_commands(self):
 		return {'turnOn': ["ip", "idx"], 'turnOff': ["ip", "idx"], 'checkStatus': ["ip", "idx"], 'getEnergyData': [],
+				'setDimmer': ["ip", "idx", "value"],
 				'checkSetOption26': ["ip", "username", "password"], 'setSetOption26': ["ip", "username", "password"],
 				'enableAutomaticShutdown': [], 'disableAutomaticShutdown': [], 'abortAutomaticShutdown': []}
 
@@ -822,6 +863,17 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 
 		elif command == 'checkStatus':
 			return flask.jsonify(self.check_status("{ip}".format(**data), "{idx}".format(**data)))
+		elif command == 'setDimmer':
+			try:
+				value = int(data["value"])
+			except (TypeError, ValueError):
+				return flask.make_response("Dimmer value must be a number from 0 to 100", 400)
+			if not 0 <= value <= 100:
+				return flask.make_response("Dimmer value must be a number from 0 to 100", 400)
+			result = self.set_dimmer("{ip}".format(**data), "{idx}".format(**data), value)
+			if result is None:
+				return flask.make_response("Device is not configured as dimmable", 400)
+			return flask.jsonify(result)
 		elif command == 'checkSetOption26':
 			response = self.checkSetOption26("{ip}".format(**data), "{username}".format(**data),
 											 "{password}".format(**data))

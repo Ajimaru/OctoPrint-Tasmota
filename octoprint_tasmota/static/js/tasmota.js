@@ -16,6 +16,7 @@ $(function() {
 		self.arrSmartplugsTooltips = ko.observableDictionary({});
 		self.arrSmartplugsStates = ko.observableDictionary({});
 		self.arrSmartplugsLEDColors = ko.observableDictionary({});
+		self.arrSmartplugsDimmer = ko.observableDictionary({});
 		self.isPrinting = ko.observable(false);
 		self.processing_api_request = ko.observable(false);
 		self.gcodeOnString = function(data){return 'M80 '+data.ip()+' '+data.idx();};
@@ -548,6 +549,7 @@ $(function() {
 							   'keepalive':ko.observable(false),
 							   'hide_off':ko.observable(false),
 							   'confirm_off':ko.observable(false),
+							   'is_dimmable':ko.observable(false),
                                'brightness':ko.observable(50)});
 			self.settings.settings.plugins.tasmota.arrSmartplugs.push(self.selectedPlug());
 			$("#TasmotaEditor").modal("show");
@@ -634,9 +636,17 @@ $(function() {
 				}
 
 
+				var has_dimmer = (data.dimmer !== undefined && data.dimmer !== null);
+				if (has_dimmer) {
+					self.arrSmartplugsDimmer.set(data.ip + '_' + data.idx, data.dimmer);
+				}
+
 				var tooltip = '';
-				if (data.sensor_data || data.energy_data) {
+				if (data.sensor_data || data.energy_data || has_dimmer) {
 					tooltip += '<table style="width: 100%"><thead></thead><tbody>';
+					if(has_dimmer) {
+						tooltip += '<tr><td>' + gettext('Brightness') + ':</td><td>' + parseInt(data.dimmer, 10) + ' %</td></tr>';
+					}
 					if(data.sensor_data) {
 						for(let k in data.sensor_data) {
 							tooltip += '<tr><td>' + k + ':</td><td>' + data.sensor_data[k] + '</td></tr>';
@@ -716,6 +726,43 @@ $(function() {
 
 		self.turnOn = function(data) {
 			self.sendTurnOn(data);
+		};
+
+		self.dimmerText = function(data) {
+			var value = self.arrSmartplugsDimmer.get(data.ip() + '_' + data.idx())();
+			return (value === null || value === undefined) ? '-' : parseInt(value, 10) + ' %';
+		};
+
+		// Sent on "change" (slider released), not on every "input" event, so
+		// dragging does not flood the device with Dimmer commands.
+		self.setDimmer = function(data, event) {
+			var value = parseInt(event.target.value, 10);
+			if (isNaN(value)) {
+				return;
+			}
+			self.processing.push(data.ip());
+			$.ajax({
+				url: API_BASEURL + "plugin/tasmota",
+				type: "POST",
+				dataType: "json",
+				data: JSON.stringify({
+					command: "setDimmer",
+					ip: data.ip(),
+					idx: data.idx(),
+					value: value
+				}),
+				contentType: "application/json; charset=UTF-8"
+			}).done(function(response){
+				self.onDataUpdaterPluginMessage('tasmota', response);
+			}).fail(function(jqXHR){
+				self.processing.remove(data.ip());
+				new PNotify({
+					title: 'Tasmota Error',
+					text: 'Could not set brightness for ' + data.label() + ': ' + (jqXHR.responseText || jqXHR.statusText),
+					type: 'error',
+					hide: true
+				});
+			});
 		};
 
 		self.sendTurnOn = function(data) {
