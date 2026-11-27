@@ -1118,12 +1118,13 @@ class tasmotaPlugin(octoprint.plugin.SettingsPlugin,
 	##~~ Softwareupdate hook
 
 	def get_update_information(self):
+		# Updates come from this fork's releases, not from the upstream repository.
 		return {'tasmota': {'displayName': "Tasmota", 'displayVersion': self._plugin_version, 'type': "github_release",
-							'user': "jneilliii", 'repo': "OctoPrint-Tasmota", 'current': self._plugin_version,
-							'stable_branch': {'name': "Stable", 'branch': "master", 'comittish': ["master"]},
+							'user': "Ajimaru", 'repo': "OctoPrint-Tasmota", 'current': self._plugin_version,
+							'stable_branch': {'name': "Stable", 'branch': "master", 'commitish': ["master"]},
 							'prerelease_branches': [
-								{'name': "Release Candidate", 'branch': "rc", 'comittish': ["rc", "master"]}
-							], 'pip': "https://github.com/jneilliii/OctoPrint-Tasmota/archive/{target_version}.zip"}}
+								{'name': "Release Candidate", 'branch': "rc", 'commitish': ["rc", "master"]}
+							], 'pip': "https://github.com/Ajimaru/OctoPrint-Tasmota/archive/{target_version}.zip"}}
 
 
 __plugin_name__ = "Tasmota"
